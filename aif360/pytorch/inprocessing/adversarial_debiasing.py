@@ -8,22 +8,19 @@ except ImportError as error:
             "pip install 'aif360[PyTorchAdversarialDebiasing]'".format(error))
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 
-default_classifier_ann = lambda input_size, hidden_units, p: nn.ModuleDict(
+default_classifier_ann = lambda input_size, hidden_units, p: nn.Sequential(
 # This is an example of a simple lambda function which can be used as a model
 # argument during instantiation. In this default function, the hidden_units are
 # a one-item list but can be a longer list for deep artificial neural networks.
 # The same applies to the dropout probability parameter.
-    {
-        "encoder": nn.Linear(input_size, hidden_units[0]),
-        "activation": nn.ReLU(),
-        "dropout": nn.Dropout(p=p[0]),
-        # "hidden1": nn.Linear(hidden_units[0], hidden_units[1]),
-        # "h1_activation": nn.ReLU(),
-        # "h1_dropout": nn.Dropout(p=p[1]),
-        "decoder": nn.Linear(hidden_units[-1], 1)
-    }
+    nn.Linear(input_size, hidden_units[0]),
+    nn.ReLU(),
+    nn.Dropout(p=p[0]),
+    # nn.Linear(hidden_units[0], hidden_units[1]),
+    # nn.ReLU(),
+    # nn.Dropout(p=p[1]),
+    nn.Linear(hidden_units[-1], 1)
 )
 
 class ClassifierModel(nn.Module):
@@ -35,7 +32,7 @@ class ClassifierModel(nn.Module):
     def __init__(self, layers, output_activation):
         r"""
         Args:
-            layers (torch.nn.ModuleDict): Ordered modules dictionary defining the
+            layers (torch.nn.Sequential): Ordered modules dictionary defining the
                 sequence of the classifier"s artificial neural network architecture.
             output_activation (torch.nn.functional.*): Activation function to be
                 applied on output layer to generate predictions.
@@ -43,40 +40,41 @@ class ClassifierModel(nn.Module):
         """
         super(ClassifierModel, self).__init__()
         
-        if type(layers) == nn.ModuleDict:
+        if type(layers) == nn.Sequential:
             self.ann = layers 
         else:
-            raise ValueError("Must enter layers as a valid torch.nn.ModuleDict object.")
+            raise ValueError("Must enter layers as a valid torch.nn.Sequential object.")
         self.output_activation = output_activation ### MUST IMPLEMENT ERROR CHECK HERE!
     
-    def forward(x):
+    def forward(self, x):
         # type: (Tensor) -> (Tensor, Tensor)
-        for module in self.ann:
-            x = self.ann[module](x)
+        x = self.ann(x)
         x_last = self.output_activation(x)
         return x_last, x
 
 class AdversaryModel(nn.Module):
     r"""Default adversary model instantiation class. Based on the TensorFlow
-    implementation of this library"s original AdversarialDebiasing class.
+    implementation of this library's original AdversarialDebiasing class.
     
     Author: Yoseph Zuskin
     """
-    
-    def __init__(self):
+    # FUTURE WORK: Implement process for more than 1 protected attributed
+    def __init__(self, y):
         super(AdversaryModel, self).__init__()
-        # instantiate constant weight variable
+        # Transform target labels into tensor object
+        self.y = torch.from_numpy(y).float()
+        # Instantiate constant weight variable
         self.c = torch.tensor(1.0, requires_grad=True)
-        # define the classifier logit decoder layer
-        self.s = nn.Sigmoid
-        # define the adversay linear encoder layer
+        # Define the classifier logit decoder layer
+        self.s = nn.Sigmoid()
+        # Define the adversary linear encoder layer
         self.encoder = nn.Linear(3, 1)
     
-    def forward(x, y):
+    def forward(self, x):
         # type: (Tensor, Tensor) -> (Tensor, Tensor)
         x = self.s(1.0 + torch.abs(self.c) * x)
-        x = nn.Linear(torch.cat([s, s * y, s * (1.0 - y)], dim=1))
-        x_last = F.sigmoid(x)
+        x = self.encoder(torch.cat([x, x * self.y, x * (1.0 - self.y)], dim=1))
+        x_last = torch.sigmoid(x)
         return x_last, x
         
 def exp_lr_scheduler(optimizer, global_step, init_lr, decay_steps, decay_rate,
@@ -114,8 +112,8 @@ class AdversarialDebiasing(Transformer):
 
     def __init__(self, unprivileged_groups, privileged_groups, debias=True,
                  seed=None, adversary_loss_weight=0.1, num_epochs=50, batch_size=128,
-                 classifier=ClassifierModel, adversay=AdversaryModel,
-                 classifier_args=[default_classifier_ann, F.sigmoid],
+                 classifier=ClassifierModel, adversary=AdversaryModel,
+                 classifier_args=[default_classifier_ann, torch.sigmoid],
                  classifier_num_hidden_units=[200], classifier_dropout_ps=[0.5],
                  adversary_args=None, device="check", weights_method="xavier_uniform_",
                  optimizer=optim.Adam, init_lr=0.001, decay_steps=1000, decay_rate=0.96,
@@ -210,7 +208,7 @@ class AdversarialDebiasing(Transformer):
             self.verbose = verbose
             
             # Declare device setting for loading Tensors onto CPU or GPU memory
-            if device.lower() in ["check", "cuda"]:
+            if device is None or device.lower() in ["check", "cuda"]:
                 self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             elif device.lower() == "cuda:0":
                 elf.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -272,7 +270,7 @@ class AdversarialDebiasing(Transformer):
         
         # Instanciate the classifier and (if debias is set to True) adversary models
         if type(self.classifier_args) is not None:
-            self.classifier_args = [classifier_args[0](self.features_dim, self.classifier_num_hidden_units,
+            self.classifier_args = [classifier_args[0](features_dim, self.classifier_num_hidden_units,
                                                        self.classifier_dropout_ps) ] + self.classifier_args[1:]
         classifier = self._classifier_model(*classifier_args).to(device)
         classifier = classifier.apply(self.weights_init)
@@ -280,6 +278,9 @@ class AdversarialDebiasing(Transformer):
             adversary = self._adversary_model() if type(self.adversary_args
             ) is None else self._adversary_model(*self.adversary_args)
             adversary = adversary.apply(self.weights_init)
+        
+        # Convert features into Tensor object
+        features = torch.from_numpy(dataset.features.float(), requires_grad=False)
         
         # Setup optimizers with exponentially decaying learning rate schedulers
         classifier_optim = self.optimizer(classifier.parameters(), lr=self.init_lr)
@@ -292,45 +293,16 @@ class AdversarialDebiasing(Transformer):
         # Define the loss function criteria & tracking list for model(s)
         criterion = nn.BCELoss(reduction="mean")
         
+        # Define lists to keep track of the fitting progress
+        classifier_losses, adversary_losses, iters = [], [], 0
         
-        
-    def _classifier_model(self, features, features_dim, keep_prob):
-        """Compute the classifier predictions for the outcome variable.
-        """
-        with tf.variable_scope("classifier_model"):
-            W1 = tf.get_variable("W1", [features_dim, self.classifier_num_hidden_units],
-                                  initializer=tf.contrib.layers.xavier_initializer(seed=self.seed1))
-            b1 = tf.Variable(tf.zeros(shape=[self.classifier_num_hidden_units]), name="b1")
-
-            h1 = tf.nn.relu(tf.matmul(features, W1) + b1)
-            h1 = tf.nn.dropout(h1, keep_prob=keep_prob, seed=self.seed2)
-
-            W2 = tf.get_variable("W2", [self.classifier_num_hidden_units, 1],
-                                 initializer=tf.contrib.layers.xavier_initializer(seed=self.seed3))
-            b2 = tf.Variable(tf.zeros(shape=[1]), name="b2")
-
-            pred_logit = tf.matmul(h1, W2) + b2
-            pred_label = tf.sigmoid(pred_logit)
-
-        return pred_label, pred_logit
-
-    def _adversary_model(self, pred_logits, true_labels):
-        """Compute the adversary predictions for the protected attribute.
-        """
-        with tf.variable_scope("adversary_model"):
-            c = tf.get_variable("c", initializer=tf.constant(1.0))
-            s = tf.sigmoid((1 + tf.abs(c)) * pred_logits)
-
-            W2 = tf.get_variable("W2", [3, 1],
-                                 initializer=tf.contrib.layers.xavier_initializer(seed=self.seed4))
-            b2 = tf.Variable(tf.zeros(shape=[1]), name="b2")
-
-            pred_protected_attribute_logit = tf.matmul(tf.concat([s, s * true_labels, s * (1.0 - true_labels)], axis=1), W2) + b2
-            pred_protected_attribute_label = tf.sigmoid(pred_protected_attribute_logit)
-
-        return pred_protected_attribute_label, pred_protected_attribute_logit
-
-    def fit(self, dataset):
+        # Begin to train both models over each epoch
+        if self.verbose:
+            print(f"Starting to train model(s) on {self.device}:")
+        #for epoch in range(self.num_epochs):
+            
+    
+    def old_fit(self, dataset):
         """Compute the model parameters of the fair classifier using gradient
         descent.
         Args:
