@@ -292,6 +292,8 @@ class AdversarialDebiasing(Transformer):
         # Define the loss function criteria & tracking list for model(s)
         criterion = nn.BCELoss(reduction="mean")
         
+        
+        
     def _classifier_model(self, features, features_dim, keep_prob):
         """Compute the classifier predictions for the outcome variable.
         """
