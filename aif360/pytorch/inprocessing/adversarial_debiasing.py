@@ -1,4 +1,5 @@
 import numpy as np
+from math import ceil
 from aif360.algorithms import Transformer
 try:
     import torch
@@ -59,43 +60,56 @@ class AdversaryModel(nn.Module):
     Author: Yoseph Zuskin
     """
     # FUTURE WORK: Implement process for more than 1 protected attributed
-    def __init__(self, y):
+    def __init__(self, c=1.0):
         super(AdversaryModel, self).__init__()
-        # Transform target labels into tensor object
-        self.y = torch.from_numpy(y).float()
         # Instantiate constant weight variable
-        self.c = torch.tensor(1.0, requires_grad=True)
+        self.c = torch.tensor(c, requires_grad=True)
         # Define the classifier logit decoder layer
         self.s = nn.Sigmoid()
         # Define the adversary linear encoder layer
         self.encoder = nn.Linear(3, 1)
     
-    def forward(self, x):
+    def forward(self, x, y):
         # type: (Tensor, Tensor) -> (Tensor, Tensor)
         x = self.s(1.0 + torch.abs(self.c) * x)
-        x = self.encoder(torch.cat([x, x * self.y, x * (1.0 - self.y)], dim=1))
+        x = self.encoder(torch.cat([x, x * y, x * (1.0 - y)], dim=1))
         x_last = torch.sigmoid(x)
         return x_last, x
-        
-def exp_lr_scheduler(optimizer, global_step, init_lr, decay_steps, decay_rate,
-                    lr_clip=None, staircase=True, verbose=False):
-    """Decay learning rate by a factor of 0.1 every lr_decay_epoch epochs.
-    
-    Author: Tejas Khot
+
+class StaircaseExponentialLR(optim.lr_scheduler._LRScheduler):
+    r"""Decays the learning rate using a dampened exponential decay process
+    with the option to toggle staircase or smooth decay patterns. Based on
+    the exp_lr_scheduler custom function published by Tejas Khot on GitHub.
     Source: https://gist.github.com/tejaskhot/2bbc4f15ba7bde33da9aa3a9dcb5c3e0
     """
-    if staircase:
-        lr = init_lr * decay_rate**(global_step // decay_steps)
-    else:
-        lr = init_lr * decay_rate**(global_step / decay_steps)
-    if type(lr_clip) is not None and type(lr_clip) == float:
-        lr = max(lr, lr_clip)
+    
+    def __init__(self, optimizer, global_steps, init_lr, decay_steps, decay_rate,
+                 lr_clip=None, staircase=True, verbose=True):
+        if not isinstance(optimizer, optim.Optimizer):
+            raise TypeError('{} is not an Optimizer'.format(
+                type(optimizer).__name__))
+        self.optimizer = optimizer
+        self.global_steps = global_steps
+        self.init_lr = init_lr
+        self.decay_steps = decay_steps
+        self.decay_rate = decay_rate
+        self.lr_clip = lr_clip
+        self.staircase = staircase
+        self.verbose = verbose
+    
+    def step(self, global_step, model_name):
+        if self.staircase:
+            lr = self.init_lr * self.decay_rate**(global_step // self.decay_steps)
+        else:
+            lr = self.init_lr * self.decay_rate**(global_step / self.decay_steps)
+        if self.lr_clip is not None and type(self.lr_clip) == float:
+            lr = max(lr, self.lr_clip)
 
-    if verbose and global_step % decay_steps == 0:
-        print("LR is set to {}".format(lr))
+        if self.verbose and global_step % self.decay_steps == 0:
+            print(f"Learning rate for {model_name} is now set to {lr}")
 
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
 
 class AdversarialDebiasing(Transformer):
     r"""Adversarial debiasing is an in-processing technique that learns a
@@ -117,7 +131,7 @@ class AdversarialDebiasing(Transformer):
                  classifier_num_hidden_units=[200], classifier_dropout_ps=[0.5],
                  adversary_args=None, device="check", weights_method="xavier_uniform_",
                  optimizer=optim.Adam, init_lr=0.001, decay_steps=1000, decay_rate=0.96,
-                 lr_clip=None, staircase=True, verbose=False, *args, **kwargs):
+                 lr_clip=None, staircase=True, verbose=True, *args, **kwargs):
             r"""
             Args:
                 unprivileged_groups (tuple): Representation for unprivileged groups.
@@ -173,10 +187,10 @@ class AdversarialDebiasing(Transformer):
             # Define the random seed for replicability of outputs
             self.seed = seed
             # Define the unprivileged and privileged groups
+            if len(unprivileged_groups) > 1 or len(privileged_groups) > 1:
+                raise ValueError("Only one unprivileged_group or privileged_group supported.")
             self.unprivileged_groups = unprivileged_groups
             self.privileged_groups = privileged_groups
-            if len(self.unprivileged_groups) > 1 or len(self.privileged_groups) > 1:
-                raise ValueError("Only one unprivileged_group or privileged_group supported.")
             self.protected_attribute_name = list(self.unprivileged_groups[0].keys())[0]
             # Define the models for this instance
             self._classifier_model = classifier
@@ -196,7 +210,10 @@ class AdversarialDebiasing(Transformer):
                 raise ValueError("The specified method must be entered as a string.")
             if self.weights_method.lower() not in ["uniform", "normal", "xavieruniform", "xaviernormal",
                                                   "kaiminguniform", "kaimingnormal"]:
-                raise ValueError("Invalid weights initializer choice.")
+                raise ValueError("Invalid weights initializer choice.")            
+            # Define lists to keep track of the fitting progress
+            self.classifier_losses = []
+            self.adversary_losses = []
             # Parameters related to optimization and learning rate decay
             self.optimizer = optimizer
             self.init_lr = init_lr
@@ -221,7 +238,9 @@ class AdversarialDebiasing(Transformer):
     def weights_init(self, m):
         r"""Initialize model wieghts with defined method (Uniform, Xavier, or Kaiming)
         """
-        if self.weights_method.lower() == "uniform":
+        if type(m) != nn.Linear:
+            pass # Skip modules without weights
+        elif self.weights_method.lower() == "uniform":
             nn.init.uniform_(m.weight.data)
             if m.bias is not None:
                 nn.init.uniform_(m.bias.data)
@@ -232,7 +251,7 @@ class AdversarialDebiasing(Transformer):
         elif self.weights_method.lower() == "xavieruniform":
             nn.init.xavier_uniform_(m.weight.data)
             if m.bias is not None:
-                nn.init.xavier_uniform_(m.bias.data)
+                nn.init.zeros_(m.bias.data)
         elif self.weights_method.lower() == "xaviernormal":
             nn.init.xavier_normal_(m.weight.data)
             if m.bias is not None:
@@ -255,53 +274,98 @@ class AdversarialDebiasing(Transformer):
             AdversarialDebiasing: Returns self.
         """
         
-        # Map the dataset labels to 0 and 1.
-        temp_labels = dataset.labels.copy()
-
-        temp_labels[(dataset.labels == dataset.favorable_label).ravel(),0] = 1.0
-        temp_labels[(dataset.labels == dataset.unfavorable_label).ravel(),0] = 0.0
-
-        # Define the number of samples and features
+        # Define the number of samples, features, global training steps
         num_train_samples, features_dim = np.shape(dataset.features)
+        global_steps = self.num_epochs * ceil(num_train_samples / self.batch_size)
         
         # Set random seed
-        if type(self.seed) is not None:
+        if self.seed is not None:
             torch.manual_seed(self.seed)
+        
+        # Create training dataset and loader objects
+        protected_attribute_index = dataset.protected_attribute_names.index(self.protected_attribute_name)
+        train_dataset = torch.utils.data.TensorDataset(
+            torch.from_numpy(dataset.features).float().to(self.device),
+            torch.from_numpy(dataset.labels).float().to(self.device),
+            torch.from_numpy(dataset.protected_attributes[:, protected_attribute_index].\
+            reshape(dataset.protected_attributes.shape[0], -1)).float().to(self.device)
+        )
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
         
         # Instanciate the classifier and (if debias is set to True) adversary models
         if type(self.classifier_args) is not None:
-            self.classifier_args = [classifier_args[0](features_dim, self.classifier_num_hidden_units,
-                                                       self.classifier_dropout_ps) ] + self.classifier_args[1:]
-        classifier = self._classifier_model(*classifier_args).to(device)
+            classifier_args = [self.classifier_args[0](features_dim, self.classifier_num_hidden_units,
+                                                      self.classifier_dropout_ps) ] + self.classifier_args[1:]
+        else:
+            classifier_args = self.classifier_args
+        classifier = self._classifier_model(*classifier_args).to(self.device)
         classifier = classifier.apply(self.weights_init)
         if self.debias:
-            adversary = self._adversary_model() if type(self.adversary_args
-            ) is None else self._adversary_model(*self.adversary_args)
+            adversary = self._adversary_model().to(self.device) if type(self.adversary_args
+            ) is None else self._adversary_model(*self.adversary_args).to(self.device)
             adversary = adversary.apply(self.weights_init)
         
-        # Convert features into Tensor object
-        features = torch.from_numpy(dataset.features.float(), requires_grad=False)
-        
         # Setup optimizers with exponentially decaying learning rate schedulers
-        classifier_optim = self.optimizer(classifier.parameters(), lr=self.init_lr)
-        adversary_optim = self.optimizer(adversary.parameters(), lr=self.init_lr)
-        classifier_lr_scheduler = exp_lr_scheduler(classifier_optim, epoch, self.init_lr, self.decay_steps,
-                                                   self.decay_rate, self.lr_clip, self.staircase, self.verbose)
-        adversary_lr_scheduler = exp_lr_scheduler(adversary_optim, epoch, self.init_lr, self.decay_steps,
-                                                   self.decay_rate, self.lr_clip, self.staircase, self.verbose)
+        classifier_optim = self.optimizer([p for p in classifier.parameters() if p.requires_grad], lr=self.init_lr)
+        classifier_lr_scheduler = StaircaseExponentialLR(classifier_optim, global_steps, self.init_lr, self.decay_steps,
+                                                        self.decay_rate, self.lr_clip, self.staircase, self.verbose)
+        classifier_lr_scheduler.initial_lr = self.init_lr
+        if self.debias:
+            adversary_optim = self.optimizer([p for p in adversary.parameters() if p.requires_grad], lr=self.init_lr)
+            adversary_lr_scheduler = StaircaseExponentialLR(adversary_optim, global_steps, self.init_lr, self.decay_steps,
+                                                           self.decay_rate, self.lr_clip, self.staircase, self.verbose)
+            adversary_lr_scheduler.initial_lr = self.init_lr
         
         # Define the loss function criteria & tracking list for model(s)
         criterion = nn.BCELoss(reduction="mean")
         
-        # Define lists to keep track of the fitting progress
-        classifier_losses, adversary_losses, iters = [], [], 0
-        
         # Begin to train both models over each epoch
+        global_step = 0
         if self.verbose:
-            print(f"Starting to train model(s) on {self.device}:")
-        #for epoch in range(self.num_epochs):
-            
-    
+            print(f'Starting to train model(s) on "{self.device}":')
+        classifier.train()
+        if self.debias:
+            adversary.train()
+        for epoch in range(self.num_epochs):
+            for i, data in enumerate(train_loader, 0):
+                # Update learning rate(s)
+                classifier_lr_scheduler.step(global_step, classifier.__class__.__name__)
+                if self.debias:
+                    adversary_lr_scheduler.step(global_step, adversary.__class__.__name__)
+                # Train the classifier model
+                classifier.zero_grad()
+                batch_features = data[:][0].to(self.device)
+                batch_labels = data[:][1].to(self.device)
+                pred_labels, pred_logits = classifier(batch_features)
+                classifier_error = criterion(pred_labels, batch_labels)
+                classifier_error.backward()
+                self.classifier_losses.append(classifier_error.item())
+                classifier_mean_error = np.mean(self.classifier_losses)
+                classifier_optim.step()
+                if self.debias: # Train the adversary model
+                    adversary.zero_grad()
+                    batch_protected_attributes = data[:][2].to(self.device)
+                    pred_protected_attributes_labels, pred_protected_attributes_logits = adversary(
+                    pred_logits, batch_labels)
+                    adversary_error = criterion(pred_protected_attributes_labels, batch_protected_attributes)
+                    adversary_error.backward()
+                    self.adversary_losses.append(adversary_error.item())
+                    adversary_mean_error = np.mean(self.adversary_losses)
+                    adversary_optim.step()
+                # Print training statistics if verbose option is set to True
+                if self.verbose and self.debias and i % 200 == 0:
+                    print("Epoch: [%d/%d] Batch: [%d/%d]\tClassifier_Loss: %.4f\tAdversary Loss: %.4f\tC(x): %.4f\tA(x, y): %.4f" % \
+                    (epoch + 1, self.num_epochs, i + 1, len(train_loader), classifier_error.item(),
+                    adversary_error.item(), classifier_mean_error, adversary_mean_error))
+                elif self.verbose and i % 200 == 0:
+                    print("Epoch: [%d/%d] Batch: [%d/%d]\tClassifier Loss: %.4f\tC(x): %.4f" % \
+                    (epoch + 1, self.num_epochs, i + 1, len(train_loader), classifier_error.item(), classifier_mean_error))
+                # Save epoch losses for later plotting
+                self.classifier_losses.append(classifier_error.item())
+                if self.debias:
+                    self.adversary_losses.append(adversary_error.item())
+                global_step += 1
+
     def old_fit(self, dataset):
         """Compute the model parameters of the fair classifier using gradient
         descent.
