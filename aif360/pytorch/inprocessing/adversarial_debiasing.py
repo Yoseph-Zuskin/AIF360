@@ -330,7 +330,7 @@ class AdversarialDebiasing(Transformer):
         # Begin to train both models over each epoch
         global_step = 0
         if self.verbose:
-            print(f'Starting to train model(s) on "{self.device}":')
+            print(f'Starting to train model(s) on {self.device.upper()}:')
         classifier.train()
         if self.debias:
             adversary.train()
@@ -389,6 +389,9 @@ class AdversarialDebiasing(Transformer):
         Returns:
             dataset (BinaryLabelDataset): Transformed dataset.
         """
+        
+        if self._classifier_model.training:
+            raise NotFittedError("The AdversarialDebiasing fit method must first be executed before using the predict method.")
         
         if self.seed is not None:
             torch.manual_seed(self.seed)
