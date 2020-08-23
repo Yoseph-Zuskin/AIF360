@@ -1,22 +1,26 @@
-import numpy as np
-from re import sub
-from math import ceil
-from aif360.algorithms import Transformer
-from sklearn.exceptions import NotFittedError
 try:
     import torch
 except ImportError as error:
     from logging import warning
     warning("{}: AdversarialDebiasing will be unavailable. To install the PyTorch version, run:\n"
-            "pip install 'aif360[PyTorchAdversarialDebiasing]'".format(error))
+            "pip install 'aif360[PyTorch]' or pip install 'aif360[All]'".format(error))
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
+from re import sub
+from math import ceil
+from copy import deepcopy
+from aif360.algorithms import Transformer
+from sklearn.exceptions import NotFittedError
+
+from inspect import getmembers, isfunction # Define list of valid PyTorch weight initialization functions
+VALID_WEIGHT_INIT = [m[0] for m in getmembers(torch.nn.init, isfunction) if '_' == m[0][-1]]
 
 default_classifier_ann = lambda input_size, hidden_units, p: nn.Sequential(
 # This is an example of a simple lambda function which can be used as a model
-# argument during instantiation. In this default function, the hidden_units are
-# a one-item list but can be a longer list for deep artificial neural networks.
-# The same applies to the dropout probability parameter.
+# argument during instantiation. In this default function, the hidden_units are an
+# one-item list, but ot can be a longer list for deep artificial neural networks.
+# The same applies to the dropout probability (p) list parameter.
     nn.Linear(input_size, hidden_units[0]),
     nn.ReLU(),
     nn.Dropout(p=p[0]),
@@ -24,25 +28,23 @@ default_classifier_ann = lambda input_size, hidden_units, p: nn.Sequential(
     # nn.ReLU(),
     # nn.Dropout(p=p[1]),
     nn.Linear(hidden_units[-1], 1)
-)
+) # (int, list, list) -> torch.nn.Sequential
 
 class ClassifierModel(nn.Module):
     r"""Dynamic classifier model instantiation class.
-    
     Author: Yoseph Zuskin
     """
     
     def __init__(self, layers, output_activation):
         r"""
         Args:
-            layers (torch.nn.Sequential): Ordered modules dictionary defining the
-                sequence of the classifier"s artificial neural network architecture.
+            layers (torch.nn.Sequential): PyTorch modules sequence which defines the
+                composition of the classifier`s artificial neural network architecture.
             output_activation (torch.nn.functional.*): Activation function to be
                 applied on output layer to generate predictions.
             
         """
         super(ClassifierModel, self).__init__()
-        
         if type(layers) == nn.Sequential:
             self.ann = layers 
         else:
@@ -58,23 +60,34 @@ class ClassifierModel(nn.Module):
 class AdversaryModel(nn.Module):
     r"""Default adversary model instantiation class. Based on the TensorFlow
     implementation of this library's original AdversarialDebiasing class.
-    
     Author: Yoseph Zuskin
     """
     # FUTURE WORK: Implement process for more than 1 protected attributed
-    def __init__(self, c=1.0):
+    def __init__(self, layers, constant=1.0):
+        r"""
+        Args:
+            layers (torch.nn.Sequential): PyTorch modules sequence which defines the
+                composition of the classifier`s artificial neural network architecture.
+            constant (int, float, optional): Constant weight variable. Default is 1.0.
+        """
         super(AdversaryModel, self).__init__()
-        # Instantiate constant weight variable
-        self.c = torch.tensor(c, requires_grad=True)
-        # Define the classifier logit decoder layer
-        self.s = nn.Sigmoid()
-        # Define the adversary linear encoder layer
-        self.encoder = nn.Linear(3, 1)
+        if type(layers) == nn.Sequential:
+            self.ann = layers 
+        else:
+            raise ValueError("Must enter layers as a valid torch.nn.Sequential object.")
+        self.c = torch.tensor(constant, requires_grad=True)
+        self.s = nn.Sigmoid() # Define the classifier logit decoder layer
+        self.encoder = nn.Linear(3, 1) # Define the adversary linear encoder layer
     
     def forward(self, x, y):
-        # type: (Tensor, Tensor) -> (Tensor, Tensor)
+        # type: (ClassifierModel, Tensor, Tensor) -> (Tensor, Tensor)
+        #print(self.classifier)
+        x = self.ann(x)
+        #print(x.grad)
         x = self.s(1.0 + torch.abs(self.c) * x)
+        #print(x.grad)
         x = self.encoder(torch.cat([x, x * y, x * (1.0 - y)], dim=1))
+        #print(x.grad)
         x_last = torch.sigmoid(x)
         return x_last, x
 
@@ -125,6 +138,7 @@ class AdversarialDebiasing(Transformer):
         .. [5] B. H. Zhang, B. Lemoine, and M. Mitchell, "Mitigating Unwanted
            Biases with Adversarial Learning," AAAI/ACM Conference on Artificial
            Intelligence, Ethics, and Society, 2018.
+    Author: Yoseph Zuskin
     """
 
     def __init__(self, unprivileged_groups, privileged_groups, debias=True,
@@ -132,9 +146,10 @@ class AdversarialDebiasing(Transformer):
                  classifier=ClassifierModel, adversary=AdversaryModel,
                  classifier_args=[default_classifier_ann, torch.sigmoid],
                  classifier_num_hidden_units=[200], classifier_dropout_ps=[0.5],
-                 adversary_args=None, device="check", weights_method="xavier_uniform_",
-                 optimizer=optim.Adam, init_lr=0.001, decay_steps=1000, decay_rate=0.96,
-                 lr_clip=None, staircase=True, verbose=True, *args, **kwargs):
+                 adversary_args=None, device="check", initializer_fn="xavier_uniform_",
+                 classifier_optimizer=optim.Adam, adversary_optimizer=optim.Adam,
+                 init_lr=0.001, decay_steps=1000, decay_rate=0.96, lr_clip=None,
+                 staircase=True, verbose=True, *args, **kwargs):
             r"""
             Args:
                 unprivileged_groups (tuple): Representation for unprivileged groups.
@@ -166,8 +181,8 @@ class AdversarialDebiasing(Transformer):
                     pred_logit parameters are passed from classifier model.
                 device (str, optional): Device setting, which can be ``cuda`` or
                     ``cpu``. Will ``check`` if cuda is available by default.
-                weights_method (str, optional): Weights initialization method choice
-                    for all layers in both classifier and adversary models. Default is
+                initializer_fn (str, torch.nn.init.*_, optional): Chosen weight initialization
+                    function. Must be a function with a name ending with ``_``. Default is
                     ``xavier_uniform_``.
                 optimizer (torch.optim.*): Optimization method to use for model fitting
                     and exponential decay of the learning rate. Default is optim.Adam.
@@ -195,30 +210,31 @@ class AdversarialDebiasing(Transformer):
             self.unprivileged_groups = unprivileged_groups
             self.privileged_groups = privileged_groups
             self.protected_attribute_name = list(self.unprivileged_groups[0].keys())[0]
+            # Define and validate the specified weight initialization function
+            if callable(initializer_fn) and initializer_fn.__name__ in VALID_WEIGHT_INIT:
+                self.initializer = initializer_fn
+            elif type(initializer_fn) == str and initializer_fn in VALID_WEIGHT_INIT:
+                self.initializer = getattr(torch.nn.init, initializer_fn)
+            else:
+                raise ValueError(f"The chosen {initializer_fn} weights initialization function is invalid.")
             # Define the models for this instance
             self._classifier_model = classifier
             self._adversary_model = adversary
             # Parameters related to the models
-            self.adversary_loss_weight = adversary_loss_weight
+            self.adversary_loss_weight = adversary_loss_weight ### The paper implements a different approach (np.sqrt(1/global_step)), see page 6 ###
             self.num_epochs = num_epochs
             self.batch_size = batch_size
             self.debias = debias
             self.classifier_args = classifier_args
             self.adversary_args = adversary_args
             self.classifier_num_hidden_units = classifier_num_hidden_units
-            self.classifier_dropout_ps = classifier_dropout_ps
-            if type(weights_method) == str:
-                self.weights_method = weights_method.lower().replace("_","").replace(" ","").replace("-","")
-            else:
-                raise ValueError("The specified method must be entered as a string.")
-            if self.weights_method.lower() not in ["uniform", "normal", "xavieruniform", "xaviernormal",
-                                                  "kaiminguniform", "kaimingnormal"]:
-                raise ValueError("Invalid weights initializer choice.")            
+            self.classifier_dropout_ps = classifier_dropout_ps        
             # Define lists to keep track of the fitting progress
             self.classifier_losses = []
             self.adversary_losses = []
             # Parameters related to optimization and learning rate decay
-            self.optimizer = optimizer
+            self.classifier_optimizer = classifier_optimizer
+            self.adversary_optimizer = adversary_optimizer
             self.init_lr = init_lr
             self.decay_steps = decay_steps
             self.decay_rate = decay_rate
@@ -238,35 +254,32 @@ class AdversarialDebiasing(Transformer):
                 raise ValueError("Device setting choice is invalid. Must be 'cuda', "+
                                  "'cuda:0', 'cpu', or (the default of) 'check'.")
 
-    def weights_init(self, m):
-        r"""Initialize model wieghts with defined method (Uniform, Xavier, or Kaiming)
+    def init_weights(self, layer):
+        r"""Initialize layer weights and biases if it has any and the chosen initializer
+        is valid. Can be applied on any layer and will only initialize parametric layers.
         """
-        if type(m) != nn.Linear:
-            pass # Skip modules without weights
-        elif self.weights_method.lower() == "uniform":
-            nn.init.uniform_(m.weight.data)
-            if m.bias is not None:
-                nn.init.uniform_(m.bias.data)
-        elif self.weights_method.lower() == "normal":
-            nn.init.normal_(m.weight.data)
-            if m.bias is not None:
-                nn.init.normal_(m.bias.data)
-        elif self.weights_method.lower() == "xavieruniform":
-            nn.init.xavier_uniform_(m.weight.data)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias.data)
-        elif self.weights_method.lower() == "xaviernormal":
-            nn.init.xavier_normal_(m.weight.data)
-            if m.bias is not None:
-                nn.init.xavier_normal_(m.bias.data)
-        elif self.weights_method.lower() == "kaiminguniform":
-            nn.init.kaiming_uniform_(m.weight.data)
-            if m.bias is not None:
-                nn.init.kaiming_uniform_(m.bias.data)
-        elif self.weights_method.lower() == "kaimingnormal":
-            nn.init.kaiming_normal_(m.weight.data)
-            if m.bias is not None:
-                nn.init.kaiming_normal_(m.bias.data)
+        
+        try:
+            layer.__getattr__('weight')
+            _has_weight = True
+        except:
+            _has_weight = False
+            
+        try:
+            layer.__getattr__('bias')
+            _has_bias = True
+        except:
+            _has_bias = False
+            
+        if _has_weight:
+            self.initializer(layer.weight.data)
+        if _has_bias:
+            try:
+                self.initializer(layer.bias.data)
+            except:
+                layer.bias.data.fill_(0.01)
+        else:
+            pass
 
     def fit(self, dataset):
         r"""Compute the model parameters of the fair classifier using gradient
@@ -286,6 +299,8 @@ class AdversarialDebiasing(Transformer):
         temp_labels[(dataset.labels == dataset.favorable_label).ravel(),0] = 1.0
         temp_labels[(dataset.labels == dataset.unfavorable_label).ravel(),0] = 0.0
         
+        dataset.labels = temp_labels.copy()
+        
         # Define the number of samples, features, global training steps
         num_train_samples, features_dim = np.shape(dataset.features)
         global_steps = self.num_epochs * ceil(num_train_samples / self.batch_size)
@@ -302,77 +317,105 @@ class AdversarialDebiasing(Transformer):
         
         # Instanciate the classifier and (if debias is set to True) adversary models
         if type(self.classifier_args) is not None:
-            classifier_args = [self.classifier_args[0](features_dim, self.classifier_num_hidden_units,
-                                                      self.classifier_dropout_ps) ] + self.classifier_args[1:]
+            ann = self.classifier_args[0](features_dim, self.classifier_num_hidden_units, self.classifier_dropout_ps)
+            classifier_args = [ann] + self.classifier_args[1:]
+            classifier = self._classifier_model(*classifier_args).to(self.device)
+            if self.debias:
+                adversary = self._adversary_model(layers=deepcopy(ann)).to(self.device) if self.adversary_args \
+                is None else self._adversary_model(layers=ann, *self.adversary_args).to(self.device)
         else:
-            classifier_args = self.classifier_args
-        classifier = self._classifier_model(*classifier_args).to(self.device)
-        classifier = classifier.apply(self.weights_init)
+            classifier = self._classifier_model.to(self.device)
+            if self.debias:
+                adversary = self._adversary_model.to(self.device)
+        classifier = classifier.apply(self.init_weights)
         if self.debias:
-            adversary = self._adversary_model().to(self.device) if type(self.adversary_args
-            ) is None else self._adversary_model(*self.adversary_args).to(self.device)
-            adversary = adversary.apply(self.weights_init)
-        
-        # Setup optimizers with exponentially decaying learning rate schedulers
-        classifier_optim = self.optimizer([p for p in classifier.parameters() if p.requires_grad], lr=self.init_lr)
+            adversary = adversary.apply(self.init_weights)
+         
+        # Setup staircase-wise exponentially decaying learning rate schedulers
+        classifier_optim = self.classifier_optimizer([p for p in classifier.parameters() if p.requires_grad], lr=self.init_lr)
         classifier_lr_scheduler = StaircaseExponentialLR(classifier_optim, global_steps, self.init_lr, self.decay_steps,
-                                                        self.decay_rate, self.lr_clip, self.staircase, self.verbose)
+                                                         self.decay_rate, self.lr_clip, self.staircase, self.verbose)
         classifier_lr_scheduler.initial_lr = self.init_lr
         if self.debias:
-            adversary_optim = self.optimizer([p for p in adversary.parameters() if p.requires_grad], lr=self.init_lr)
+            adversary_optim = self.adversary_optimizer([p for p in adversary.parameters() if p.requires_grad], lr=self.init_lr)
             adversary_lr_scheduler = StaircaseExponentialLR(adversary_optim, global_steps, self.init_lr, self.decay_steps,
-                                                           self.decay_rate, self.lr_clip, self.staircase, self.verbose)
+                                                            self.decay_rate, self.lr_clip, self.staircase, self.verbose)
             adversary_lr_scheduler.initial_lr = self.init_lr
         
         # Define the loss function criteria & tracking list for model(s)
-        criterion = nn.BCELoss(reduction="mean")
+        classifier_criterion = nn.BCELoss(reduction="mean")
+        adversary_criterion = nn.BCELoss(reduction="mean")
+        
+        # Define unit vector normalization function for adversary-to-classifier gradient projection
+        normalize = lambda x: x / (torch.norm(x) + np.finfo(np.float32).tiny)
         
         # Begin to train both models over each epoch
         global_step = 0
         if self.verbose:
-            print(f'Starting to train model(s) on {self.device.upper()}:')
-        classifier.train()
-        if self.debias:
-            adversary.train()
+            print(f'Starting to train model(s) on {self.device.type}:')
+        #classifier.train()
+        #if self.debias:
+        #    adversary.train()
         for epoch in range(self.num_epochs):
-            for i, data in enumerate(train_loader, 0):
-                # Update learning rate(s)
-                classifier_lr_scheduler.step(global_step, classifier.__class__.__name__)
-                if self.debias:
+            if self.debias:
+                for i, data in enumerate(train_loader, 0):
+                    # Update learning rates
+                    classifier_lr_scheduler.step(global_step, classifier.__class__.__name__)
                     adversary_lr_scheduler.step(global_step, adversary.__class__.__name__)
-                # Train the classifier model
-                classifier.zero_grad()
-                batch_features = data[:][0].to(self.device)
-                batch_labels = data[:][1].to(self.device)
-                pred_labels, pred_logits = classifier(batch_features)
-                classifier_error = criterion(pred_labels, batch_labels)
-                classifier_error.backward()
-                self.classifier_losses.append(classifier_error.item())
-                classifier_mean_error = np.mean(self.classifier_losses)
-                if self.debias: # Train the adversary model
+                    # Train the classifier model
+                    classifier.zero_grad()
+                    batch_features = data[:][0].to(self.device)
+                    batch_labels = data[:][1].to(self.device)
+                    pred_labels, pred_logits = classifier(batch_features)
+                    classifier_error = classifier_criterion(pred_labels, batch_labels)
+                    self.classifier_losses.append(classifier_error.item())
+                    classifier_mean_error = np.mean(self.classifier_losses)
+                    classifier_error.backward()
+                    # Update the parameters for the classifier layers within the adversary model
+                    c_params, a_params = dict(classifier.named_parameters()), dict(adversary.named_parameters())
+                    for (c_p, a_p) in zip(c_params.values(), a_params.values()): # The zip is line an inner join
+                        a_p.data = deepcopy(c_p.data)
+                    # Train the adversary
                     adversary.zero_grad()
-                    batch_protected_attributes = data[:][2].to(self.device)
+                    batch_protected_attributes_labels = data[:][2].to(self.device)
                     pred_protected_attributes_labels, pred_protected_attributes_logits = adversary(
-                    pred_logits, batch_labels)
-                    adversary_error = criterion(pred_protected_attributes_labels, batch_protected_attributes)
+                    batch_features, batch_labels)
+                    adversary_error = adversary_criterion(pred_protected_attributes_labels, batch_protected_attributes_labels)
                     adversary_error.backward()
                     self.adversary_losses.append(adversary_error.item())
                     adversary_mean_error = np.mean(self.adversary_losses)
+                    # Adjust the classifier's gradients according to the normnalized adversary gradients
+                    c_params, a_params = dict(classifier.named_parameters()), dict(adversary.named_parameters())
+                    for p in c_params:
+                        unit_adversary_grad = normalize(a_params[p].grad)
+                        c_params[p].grad -= torch.sum((c_params[p].grad * unit_adversary_grad))
+                        c_params[p].grad -= self.adversary_loss_weight * a_params[p].grad
                     adversary_optim.step() # Update adversary model parameters
-                classifier_optim.step() # Update classifier model parameters
-                # Print training statistics if verbose option is set to True
-                if self.verbose and self.debias and i % 200 == 0:
-                    print("Epoch: [%d/%d] Batch: [%d/%d]\tClassifier_Loss: %.4f\tAdversary Loss: %.4f\tC(x): %.4f\tA(x, y): %.4f" % \
-                    (epoch + 1, self.num_epochs, i + 1, len(train_loader), classifier_error.item(),
+                    classifier_optim.step() # Update classifier model parameters
+                    if i % 200 == 0:
+                        print("Epoch: [%d/%d] Batch: [%d/%d]\tClassifier_Loss: %.4f\tAdversary Loss: %.4f\tC(x): %.4f\tA(x, y): %.4f" % \
+                        (epoch + 1, self.num_epochs, i + 1, len(train_loader), self.classifier_losses[-1],
                     adversary_error.item(), classifier_mean_error, adversary_mean_error))
-                elif self.verbose and i % 200 == 0:
-                    print("Epoch: [%d/%d] Batch: [%d/%d]\tClassifier Loss: %.4f\tC(x): %.4f" % \
-                    (epoch + 1, self.num_epochs, i + 1, len(train_loader), classifier_error.item(), classifier_mean_error))
-                # Save epoch losses for later plotting
-                self.classifier_losses.append(classifier_error.item())
-                if self.debias:
-                    self.adversary_losses.append(adversary_error.item())
-                global_step += 1
+                    global_step += 1
+            else:
+                for i, data in enumerate(train_loader, 0):
+                    # Update learning rates
+                    classifier_lr_scheduler.step(global_step, classifier.__class__.__name__)
+                    # Train the classifier model
+                    classifier.zero_grad()
+                    batch_features = data[:][0].to(self.device)
+                    batch_labels = data[:][1].to(self.device)
+                    pred_labels, pred_logits = classifier(batch_features)
+                    classifier_error = classifier_criterion(pred_labels, batch_labels)
+                    classifier_error.backward()
+                    self.classifier_losses.append(classifier_error.item())
+                    classifier_mean_error = np.mean(self.classifier_losses)
+                    classifier_optim.step() # Update classifier model parameters
+                    # Print training statistics if verbose option is set to True
+                    if self.verbose and i % 200 == 0:
+                        print("Epoch: [%d/%d] Batch: [%d/%d]\tClassifier Loss: %.4f\tC(x): %.4f" % \
+                        (epoch + 1, self.num_epochs, i + 1, len(train_loader), self.classifier_losses[-1], classifier_mean_error))
+                    global_step += 1
         classifier.training = False
         self._classifier_model = classifier
         if self.debias:

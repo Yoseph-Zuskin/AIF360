@@ -9,7 +9,6 @@ except ImportError as error:
 
 from aif360.algorithms import Transformer
 
-
 class AdversarialDebiasing(Transformer):
     """Adversarial debiasing is an in-processing technique that learns a
     classifier to maximize prediction accuracy and simultaneously reduce an
@@ -163,26 +162,36 @@ class AdversarialDebiasing(Transformer):
                 adversary_opt = tf.train.AdamOptimizer(learning_rate)
 
             classifier_vars = [var for var in tf.trainable_variables() if 'classifier_model' in var.name]
+            print('0', classifier_vars)
             if self.debias:
                 adversary_vars = [var for var in tf.trainable_variables() if 'adversary_model' in var.name]
+                print('1', adversary_vars)
                 # Update classifier parameters
                 adversary_grads = {var: grad for (grad, var) in adversary_opt.compute_gradients(pred_protected_attributes_loss,
                                                                                       var_list=classifier_vars)}
+                print('2', adversary_grads)
             normalize = lambda x: x / (tf.norm(x) + np.finfo(np.float32).tiny)
 
             classifier_grads = []
             for (grad,var) in classifier_opt.compute_gradients(pred_labels_loss, var_list=classifier_vars):
                 if self.debias:
+                    print('3.0\n', grad, '\n', adversary_grads[var])
                     unit_adversary_grad = normalize(adversary_grads[var])
+                    print('3.1\n', unit_adversary_grad, '\n', tf.reduce_sum(grad * unit_adversary_grad) * unit_adversary_grad)
                     grad -= tf.reduce_sum(grad * unit_adversary_grad) * unit_adversary_grad
+                    print('3.2\n', grad, '\n', self.adversary_loss_weight * adversary_grads[var])
                     grad -= self.adversary_loss_weight * adversary_grads[var]
+                    print('3.3\n', grad)
                 classifier_grads.append((grad, var))
+                print('3', '\n', var, '\n', classifier_grads)
             classifier_minimizer = classifier_opt.apply_gradients(classifier_grads, global_step=global_step)
+            print('4', classifier_minimizer)
 
             if self.debias:
                 # Update adversary parameters
                 with tf.control_dependencies([classifier_minimizer]):
                     adversary_minimizer = adversary_opt.minimize(pred_protected_attributes_loss, var_list=adversary_vars)#, global_step=global_step)
+                    print('5', adversary_minimizer)
 
             self.sess.run(tf.global_variables_initializer())
             self.sess.run(tf.local_variables_initializer())
