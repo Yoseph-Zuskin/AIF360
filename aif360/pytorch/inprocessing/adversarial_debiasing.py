@@ -50,20 +50,19 @@ class ClassifierModel(nn.Module):
             self.ann = layers 
         else:
             raise ValueError("Must enter layers as a valid torch.nn.Sequential object.")
-        self.output_activation = output_activation ### MUST IMPLEMENT ERROR CHECK HERE!
+        self.output_activation = output_activation
     
     def forward(self, x):
         # type: (Tensor) -> (Tensor, Tensor)
         x = self.ann(x)
         x_last = self.output_activation(x)
-        return x_last, x
+        return x_last
 
 class AdversaryModel(nn.Module):
     r"""Default adversary model instantiation class. Based on the TensorFlow
     implementation of this library's original AdversarialDebiasing class.
     Author: Yoseph Zuskin
     """
-    # FUTURE WORK: Implement process for more than 1 protected attributed
     def __init__(self, layers, constant=1.0):
         r"""
         Args:
@@ -82,15 +81,11 @@ class AdversaryModel(nn.Module):
     
     def forward(self, x, y):
         # type: (ClassifierModel, Tensor, Tensor) -> (Tensor, Tensor)
-        #print(self.classifier)
         x = self.ann(x)
-        #print(x.grad)
         x = self.s(1.0 + torch.abs(self.c) * x)
-        #print(x.grad)
         x = self.encoder(torch.cat([x, x * y, x * (1.0 - y)], dim=1))
-        #print(x.grad)
         x_last = torch.sigmoid(x)
-        return x_last, x
+        return x_last
 
 class StaircaseExponentialLR(optim.lr_scheduler._LRScheduler):
     r"""Decays the learning rate using a dampened exponential decay process
@@ -398,7 +393,7 @@ class AdversarialDebiasing(Transformer):
                     self.classifier.zero_grad()
                     batch_features = data[:][0].to(self.device)
                     batch_labels = data[:][1].to(self.device)
-                    pred_labels, pred_logits = self.classifier(batch_features)
+                    pred_labels = self.classifier(batch_features)
                     classifier_error = self.classifier_criterion(pred_labels, batch_labels)
                     self.classifier_losses.append(classifier_error.item())
                     classifier_mean_error = np.mean(self.classifier_losses)
@@ -410,8 +405,7 @@ class AdversarialDebiasing(Transformer):
                     # Train the adversary
                     self.adversary.zero_grad()
                     batch_protected_attributes_labels = data[:][2].to(self.device)
-                    pred_protected_attributes_labels, pred_protected_attributes_logits = self.adversary(
-                    batch_features, batch_labels)
+                    pred_protected_attributes_labels = self.adversary(batch_features, batch_labels)
                     adversary_error = self.adversary_criterion(pred_protected_attributes_labels, batch_protected_attributes_labels)
                     adversary_error.backward()
                     self.adversary_losses.append(adversary_error.item())
@@ -437,7 +431,7 @@ class AdversarialDebiasing(Transformer):
                     self.classifier.zero_grad()
                     batch_features = data[:][0].to(self.device)
                     batch_labels = data[:][1].to(self.device)
-                    pred_labels, pred_logits = self.classifier(batch_features)
+                    pred_labels = self.classifier(batch_features)
                     classifier_error = self.classifier_criterion(pred_labels, batch_labels)
                     classifier_error.backward()
                     self.classifier_losses.append(classifier_error.item())
